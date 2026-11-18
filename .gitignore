@@ -1,0 +1,40 @@
+# Editor settings and local workspace state
+.vscode/
+
+# Python bytecode and analysis caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Downloaded experiment inputs and archived result arrays.
+# Keep README.md files so each published data folder can explain where to download its contents.
+/EXP/data/**
+!/EXP/data/**/
+!/EXP/data/**/README.md
+/EXP/traces/**
+!/EXP/traces/**/
+!/EXP/traces/**/README.md
+/EXP/metadata/**
+!/EXP/metadata/**/
+!/EXP/metadata/**/README.md
+!/EXP/metadata/mldsa_m4/s1.npy
+!/EXP/metadata/mldsa_m4/seed_and_rej_num.txt
+!/EXP/metadata/mldsa_ref/s1.npy
+!/EXP/metadata/mldsa_ref/seed_and_rej_num.txt
+/EXP/exp_res/**
+!/EXP/exp_res/**/
+!/EXP/exp_res/**/README.md
+
+# Recomputed workspaces and rendered figures are generated locally.
+# Preserve README.md files in case a folder includes usage or download notes.
+/EXP/reproducibility/**
+!/EXP/reproducibility/**/
+!/EXP/reproducibility/**/README.md
+/EXP/figures/**
+!/EXP/figures/**/
+!/EXP/figures/**/README.md
+
+# Common operating-system files
+.DS_Store
+Thumbs.db

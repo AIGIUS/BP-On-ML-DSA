@@ -11,7 +11,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tqdm
 
-plt.rc("font", family="Times New Roman")
+# Use the platform's bundled serif font; Times New Roman is not installed on
+# every analysis host and otherwise emits thousands of font lookup warnings.
+plt.rc("font", family="serif")
 
 
 def softmax(x):
@@ -1004,20 +1006,4 @@ def view_bp_res_vary_c_acc(
 
 
 if __name__ == "__main__":
-    # draw_bp_fig("ml-dsa-m4")
-    # draw_c_ta_res()
-    # draw_cs1_ta_res()
-    # draw_y_ta_res()
-    # draw_convergence_speed("ml-dsa-m4")
-    view_bp_res_vary_c_acc(
-        "ml-dsa-m4",
-        exp_min_sign_num=1,
-        exp_max_sign_num=30,
-        exp_repeat_num=10,
-        c_acc_list=[1.00, 0.99, 0.98, 0.97],
-        sig_used="rej",
-    )
-    # view_bp_res_vary_c_acc("ml-dsa-ref", exp_min_sign_num=1, exp_max_sign_num=30, exp_repeat_num=10, c_acc_list=[1.00,0.99,0.98,0.97,0.96], sig_used="rej")
-    # view_bp_res_vary_c_acc("ml-dsa-ref", exp_min_sign_num=1, exp_max_sign_num=20, exp_repeat_num=10, c_acc_list=[0.99,0.98,0.97,0.96,0.95], sig_used="all")
-    # view_bp_res_vary_c_acc("ml-dsa-m4", exp_min_sign_num=1, exp_max_sign_num=20, exp_repeat_num=10, c_acc_list=[0.99,0.98,0.97,0.96], sig_used="all")
-    pass
+    print("Use `python py_code/reproduce.py render --figures all` from EXP.")

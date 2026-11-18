@@ -1,18 +1,52 @@
 import random
 import sys
 import time
+import os
+# The analysis already parallelizes over coefficients/signatures. Limit nested
+# BLAS/OpenMP pools by default so each worker does not start another CPU-sized pool.
+_configured_thread_count = next(
+    (
+        os.environ[name]
+        for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+        if os.environ.get(name)
+    ),
+    "1",
+)
+try:
+    _configured_thread_count = max(1, int(_configured_thread_count))
+except ValueError:
+    _configured_thread_count = 1
+for _thread_env in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env, "1")
+if not os.environ.get("DISPLAY"):
+    import matplotlib
+
+    matplotlib.use("Agg")
 import numpy as np
+import argparse
+from pathlib import Path
 from matplotlib import pyplot as plt
 import serial
 import serial.tools.list_ports
 import ctypes
-import os
 import tqdm
 from picosdk.ps3000a import ps3000a as ps
 from picosdk.functions import adc2mV, assert_pico_ok
 from multiprocessing import Pool, Queue, Process, Manager
 from multiprocessing import shared_memory, RLock, resource_tracker
 from Template_Attack import Template
+from threadpoolctl import threadpool_limits
+
+
+_THREADPOOL_LIMITER = threadpool_limits(limits=_configured_thread_count)
+
+
+ANALYSIS_WORKERS = min(6, os.cpu_count() or 1)
 
 
 def c_value2label(c1, c2):
@@ -189,6 +223,59 @@ def calc_snr_single_coeff_shared(args):
         # Close shared memory connections
         train_trs_shm.close()
         train_label_shm.close()
+
+
+def calc_snr_matrix_shared(
+    train_trs, train_labels, trs_len, min_class_count=0, workers=None, desc="Calculating SNR"
+):
+    """Calculate all coefficient SNRs without serializing large arrays per task."""
+    train_trs = np.asarray(train_trs, dtype=int)
+    train_labels = np.asarray(train_labels, dtype=int)
+    if train_trs.ndim != 2 or train_labels.ndim != 2:
+        raise ValueError("SNR inputs must be two-dimensional arrays")
+    if train_trs.shape[0] != train_labels.shape[0]:
+        raise ValueError("SNR trace and label counts do not match")
+    if train_trs.shape[1] != trs_len:
+        raise ValueError("SNR trace length does not match trs_len")
+
+    workers = max(1, int(workers or ANALYSIS_WORKERS))
+    snr = np.zeros((train_labels.shape[1], trs_len), dtype=float)
+    traces_shm = labels_shm = None
+    try:
+        traces_shm = shared_memory.SharedMemory(
+            create=True, size=max(1, train_trs.nbytes)
+        )
+        labels_shm = shared_memory.SharedMemory(
+            create=True, size=max(1, train_labels.nbytes)
+        )
+        np.ndarray(train_trs.shape, dtype=int, buffer=traces_shm.buf)[:] = train_trs
+        np.ndarray(train_labels.shape, dtype=int, buffer=labels_shm.buf)[:] = train_labels
+
+        args = [
+            (
+                j,
+                traces_shm.name,
+                labels_shm.name,
+                train_trs.shape,
+                train_labels.shape,
+                trs_len,
+                min_class_count,
+            )
+            for j in range(train_labels.shape[1])
+        ]
+        chunksize = max(1, len(args) // (workers * 4))
+        with Pool(processes=workers) as pool:
+            results = pool.imap(calc_snr_single_coeff_shared, args, chunksize=chunksize)
+            for j, coeff_snr in tqdm.tqdm(results, total=len(args), desc=desc):
+                snr[j] = coeff_snr
+    finally:
+        if traces_shm is not None:
+            traces_shm.close()
+            traces_shm.unlink()
+        if labels_shm is not None:
+            labels_shm.close()
+            labels_shm.unlink()
+    return snr
 
 
 def template_attack_single_coeff(args):
@@ -677,6 +764,7 @@ def y_valid_bp_experiment(
     snr_threshold=0.5,
     use_parallel_gen_sp=False,
     bp_process_num=5,
+    run_bp=True,
 ):
     """
     BP experiment using y_valid data
@@ -794,22 +882,14 @@ def y_valid_bp_experiment(
 
     if rerun_snr:
         print("Calculating SNR and selecting points of interest...")
-        # Calculate SNR (multiprocessing)
-        print("Calculating SNR (multiprocessing)...")
-        train_snr = np.zeros((256, trs_len), dtype=float)
-
-        pool = Pool(8)  # Use 8 processes
-        snr_args = [(j, train_trs, train_label_y, trs_len, 0) for j in range(256)]
-        snr_results = []
-        with tqdm.tqdm(total=256, desc="Calculating SNR") as pbar:
-            for result in pool.imap(calc_snr_single_coeff, snr_args, chunksize=4):
-                snr_results.append(result)
-                pbar.update(1)
-        pool.close()
-        pool.join()
-
-        for j, snr in snr_results:
-            train_snr[j] = snr
+        train_snr = calc_snr_matrix_shared(
+            train_trs,
+            train_label_y,
+            trs_len,
+            min_class_count=0,
+            workers=ANALYSIS_WORKERS,
+            desc="Calculating SNR",
+        )
 
         # Save SNR file
         np.save(exp_save_path + "y_valid_snr", train_snr)
@@ -849,7 +929,7 @@ def y_valid_bp_experiment(
     if rerun_ta:
         print("Performing template attack modeling (multiprocessing)...")
 
-        pool = Pool(8)  # Use 8 processes
+        pool = Pool(ANALYSIS_WORKERS)
         ta_args = [
             (
                 i,
@@ -899,7 +979,10 @@ def y_valid_bp_experiment(
     print(f"Number of coefficients with accuracy > 0.5: {np.sum(test_ta_acc > 0.5)}")
     print(f"Number of coefficients with accuracy > 0.7: {np.sum(test_ta_acc > 0.7)}")
 
-    exit()
+    if not run_bp:
+        print("Y template-attack analysis complete; BP is not part of the paper's y result.")
+        print(f"Results saved in: {exp_save_path}")
+        return
 
     # Step 6: BP experiment (serial execution, internal parallelization optimization)
     print("Starting BP experiment...")
@@ -959,19 +1042,21 @@ def y_valid_bp_experiment(
     print(f"Results saved in: {exp_save_path}")
 
 
+_VALID_BP_WORKER_DATA = None
+
+
+def _init_valid_bp_worker(test_cs1_prob, test_c, test_sign_num):
+    """Install read-only experiment arrays once per worker instead of per task."""
+    global _VALID_BP_WORKER_DATA
+    _VALID_BP_WORKER_DATA = (test_cs1_prob, test_c, test_sign_num)
+
+
 def run_single_bp_experiment(args):
-    """单个BP实验的全局函数，用于多进程，包含完整的BP实现"""
-    (
-        exp_idx,
-        bp_sign_num,
-        test_sign_num,
-        test_cs1_prob,
-        test_c,
-        bp_iter_num,
-        exp_save_path,
-        exp_repeat_seed,
-        test_ta_acc,
-    ) = args
+    """Run one valid-signature BP experiment in a worker process."""
+    exp_idx, bp_sign_num, bp_iter_num, exp_save_path, exp_repeat_seed = args
+    if _VALID_BP_WORKER_DATA is None:
+        raise RuntimeError("Valid-signature BP worker was not initialized")
+    test_cs1_prob, test_c, test_sign_num = _VALID_BP_WORKER_DATA
 
     # 设置随机种子
     np.random.seed(exp_repeat_seed + exp_idx)
@@ -984,9 +1069,6 @@ def run_single_bp_experiment(args):
     #     (np.arange(16, 128, dtype=int), np.arange(144, 256, dtype=int))
     # )
     used_coeff_idx = np.arange(256, dtype=int)
-    # for coeff_idx in used_coeff_idx:
-    #     print("coeff_idx: %d, acc: %f" % (coeff_idx, test_ta_acc[coeff_idx]))
-
     # 构建约束矩阵
     BP_C = np.zeros((bp_sign_num * len(used_coeff_idx), 256, 3), dtype=float)
     BP_CS = np.zeros(
@@ -1265,30 +1347,15 @@ def cs1_valid_bp_experiment(
 
     if rerun_snr:
         print("Calculating SNR and selecting points of interest...")
-        # Calculate SNR (multiprocessing)
-        print("Calculating SNR (multiprocessing)...")
-        train_snr = np.zeros((256, trs_len), dtype=float)
-
-        pool = Pool(8)  # Use 8 processes，避免过度竞争
         min_class_count = class_reserve_threshold  # 最小类别数量阈值
-        snr_args = [
-            (j, train_trs, train_label_cs1, trs_len, min_class_count)
-            for j in range(256)
-        ]
-        snr_results = []
-        # 计算chunk_size：任务数量/(进程数*4)
-        snr_chunk_size = max(1, len(snr_args) // (8 * 4))
-        with tqdm.tqdm(total=256, desc="Calculating SNR") as pbar:
-            for result in pool.imap(
-                calc_snr_single_coeff, snr_args, chunksize=snr_chunk_size
-            ):
-                snr_results.append(result)
-                pbar.update(1)
-        pool.close()
-        pool.join()
-
-        for j, snr in snr_results:
-            train_snr[j] = snr
+        train_snr = calc_snr_matrix_shared(
+            train_trs,
+            train_label_cs1,
+            trs_len,
+            min_class_count=min_class_count,
+            workers=ANALYSIS_WORKERS,
+            desc="Calculating SNR",
+        )
 
         # Save SNR file
         np.save(exp_save_path + "cs1_valid_snr", train_snr)
@@ -1328,7 +1395,7 @@ def cs1_valid_bp_experiment(
     if rerun_ta:
         print("Performing template attack modeling (multiprocessing)...")
 
-        pool = Pool(4)  # 使用8个进程
+        pool = Pool(ANALYSIS_WORKERS)
         ta_args = []
         for i in range(256):
             ta_args.append(
@@ -1584,13 +1651,9 @@ def cs1_valid_bp_experiment(
                 (
                     exp_idx,
                     bp_sign_num,
-                    test_sign_num,
-                    test_cs1_prob,
-                    test_c,
                     bp_iter_num,
                     exp_save_path,
                     exp_repeat_seed,
-                    test_ta_acc,
                 )
             )
 
@@ -1599,7 +1662,11 @@ def cs1_valid_bp_experiment(
     #     run_single_bp_experiment(args)
 
     # 使用多进程并行执行所有实验
-    with Pool(10) as pool:
+    with Pool(
+        ANALYSIS_WORKERS,
+        initializer=_init_valid_bp_worker,
+        initargs=(test_cs1_prob, test_c, test_sign_num),
+    ) as pool:
         with tqdm.tqdm(
             total=exp_repeat_num * (exp_max_sign_num - exp_min_sign_num + 1),
             desc=f"总实验进度",
@@ -1621,7 +1688,7 @@ def c_all_cs1_all_bp_experiment(
     snr_cs1_plot: bool = True,
     rerun_cs1_ta: bool = True,
     process_num: int = 8,
-    poi_num: int = 100,
+    poi_num: int = 200,
     exp_repeat_num: int = 10,
     exp_min_sign_num: int = 1,
     exp_max_sign_num: int = 20,
@@ -1826,7 +1893,7 @@ def c_all_cs1_all_bp_experiment(
     if rerun_c_ta:
         print("Performing template attack modeling (multiprocessing)...")
 
-        pool = Pool(processes=4)
+        pool = Pool(processes=ANALYSIS_WORKERS)
         ta_args = [
             (
                 i,
@@ -2202,7 +2269,7 @@ def c_all_cs1_all_bp_experiment(
     if rerun_cs1_ta:
         print("Performing template attack modeling (multiprocessing)...")
 
-        pool = Pool(4)  # 使用8个进程
+        pool = Pool(ANALYSIS_WORKERS)
         ta_args = []
         for i in range(256):
             ta_args.append(
@@ -2593,20 +2660,19 @@ def c_all_cs1_all_bp_experiment(
                 )
             )
 
+        # Dispatch one signature-count batch at a time. Holding every BP matrix
+        # for all counts and repetitions can consume tens of gigabytes.
+        with Pool(ANALYSIS_WORKERS) as pool:
+            with tqdm.tqdm(total=len(bp_args), desc=f"BP for {bp_sign_num} signatures") as pbar:
+                for _ in pool.imap_unordered(
+                    run_single_bp_experiment_more_simple, bp_args, chunksize=1
+                ):
+                    pbar.update(1)
+        bp_args.clear()
+
     # 单进程写法
     # for args in bp_args:
     #     run_single_bp_experiment_more_simple(args)
-
-    # 使用多进程并行执行所有实验
-    with Pool(12) as pool:
-        with tqdm.tqdm(
-            total=len(bp_args),
-            desc=f"总实验进度",
-        ) as pbar:
-            for _ in pool.imap_unordered(
-                run_single_bp_experiment_more_simple, bp_args, chunksize=1
-            ):
-                pbar.update(1)
 
     print("cs1_valid BP实验完成！")
     print(f"Results saved in: {exp_save_path}")
@@ -2617,6 +2683,7 @@ def c_all_cs1_all_bp_vary_c_acc_experiment(
     exp_min_sign_num: int = 1,
     exp_max_sign_num: int = 20,
     bp_iter_num: int = 15,
+    c_acc_values=(0.95, 0.96, 0.97, 0.98, 0.99),
 ):
     """
     使用全部的c,以及cs1进行bp实验,不包括y是因为y的信噪比较低,先看看纯cs1的效果。
@@ -2701,7 +2768,7 @@ def c_all_cs1_all_bp_vary_c_acc_experiment(
     exp_repeat_seed = 234567  # Fixed seed
     bp_args = []
     # 提前将bp所需的CS和C矩阵在这里构造后，后面就只需要直接sumprouct就行了，减少多进程内存开销
-    for c_acc in [0.96]:
+    for c_acc in c_acc_values:
         for bp_sign_num in tqdm.trange(
             exp_min_sign_num,
             exp_max_sign_num + 1,
@@ -2792,19 +2859,19 @@ def c_all_cs1_all_bp_vary_c_acc_experiment(
                     )
                 )
 
-        # 使用多进程并行执行所有实验
-        with Pool(14) as pool:
-            with tqdm.tqdm(
-                total=len(bp_args),
-                desc=f"总实验进度",
-            ) as pbar:
-                for _ in pool.imap_unordered(
-                    run_single_bp_experiment_more_simple_vary_c_acc,
-                    bp_args,
-                    chunksize=2,
-                ):
-                    pbar.update(1)
-        bp_args.clear()
+            # Keep only one signature-count batch of BP matrices in memory.
+            with Pool(ANALYSIS_WORKERS) as pool:
+                with tqdm.tqdm(
+                    total=len(bp_args),
+                    desc=f"c_acc={c_acc:.2f}, signatures={bp_sign_num}",
+                ) as pbar:
+                    for _ in pool.imap_unordered(
+                        run_single_bp_experiment_more_simple_vary_c_acc,
+                        bp_args,
+                        chunksize=1,
+                    ):
+                        pbar.update(1)
+            bp_args.clear()
 
     print("BP实验完成！")
     print(f"Results saved in: {exp_save_path}")
@@ -2815,6 +2882,7 @@ def c_rej_cs1_rej_bp_vary_c_acc_experiment(
     exp_min_sign_num: int = 1,
     exp_max_sign_num: int = 20,
     bp_iter_num: int = 15,
+    c_acc_values=(0.95, 0.96, 0.97, 0.98, 0.99, 1.00),
 ):
     """
     使用全部的c,以及cs1进行bp实验,不包括y是因为y的信噪比较低,先看看纯cs1的效果。
@@ -2899,7 +2967,7 @@ def c_rej_cs1_rej_bp_vary_c_acc_experiment(
     exp_repeat_seed = 234567  # Fixed seed
     bp_args = []
     # 提前将bp所需的CS和C矩阵在这里构造后，后面就只需要直接sumprouct就行了，减少多进程内存开销
-    for c_acc in [0.97, 0.98, 0.99, 1.00]:
+    for c_acc in c_acc_values:
         for bp_sign_num in tqdm.trange(
             exp_min_sign_num,
             exp_max_sign_num + 1,
@@ -2996,19 +3064,18 @@ def c_rej_cs1_rej_bp_vary_c_acc_experiment(
                     )
                 )
 
-    # 使用多进程并行执行所有实验
-    with Pool(30) as pool:
-        with tqdm.tqdm(
-            total=len(bp_args),
-            desc=f"总实验进度",
-        ) as pbar:
-            for _ in pool.imap_unordered(
-                run_single_bp_experiment_more_simple_vary_c_acc,
-                bp_args,
-                chunksize=1,
-            ):
-                pbar.update(1)
-    bp_args.clear()
+            with Pool(ANALYSIS_WORKERS) as pool:
+                with tqdm.tqdm(
+                    total=len(bp_args),
+                    desc=f"c_acc={c_acc:.2f}, signatures={bp_sign_num}",
+                ) as pbar:
+                    for _ in pool.imap_unordered(
+                        run_single_bp_experiment_more_simple_vary_c_acc,
+                        bp_args,
+                        chunksize=1,
+                    ):
+                        pbar.update(1)
+            bp_args.clear()
 
     print("BP实验完成！")
     print(f"Results saved in: {exp_save_path}")
@@ -4620,258 +4687,340 @@ def process_equation_batch_sumproduct(args):
     return start_idx, sk_nodes_batch
 
 
-def batch_cut_traces():
+def batch_cut_traces(trace_dirs=("y",)):
     """
     批量处理波形截取函数
     读取 ../traces/ 目录下的 c, cs1, y 三个目录的波形文件
     根据触发信号截取波形，保存到对应的 cut 目录中
     """
-    base_traces_dir = "../traces/"
+    base_traces_dir = Path("../traces")
     trigger_threshold = 15000
-    min_trs_len = 5000  # 最小波形长度阈值
-    total_sign_num = 10000
+    min_trs_len = 5000
+    trace_dirs = tuple(trace_dirs)
+    invalid = set(trace_dirs) - {"y", "c", "cs1"}
+    if invalid:
+        raise ValueError(f"Unknown trace type(s): {sorted(invalid)}")
 
-    # 定义源目录和目标目录
-    # trace_dirs = ["c", "cs1", "y"]
-    trace_dirs = ["y"]
+    with open("seed and rej num.txt", "r", encoding="ascii") as seed_file:
+        seed_rows = [line.split() for line in seed_file]
+    if len(seed_rows) != 10_000 or any(len(row) != 2 for row in seed_rows):
+        raise ValueError("Expected exactly 10,000 seed/rejection-count rows")
+    rejection_counts = np.asarray([int(row[1]) for row in seed_rows], dtype=int)
+    if np.any(rejection_counts < 1):
+        raise ValueError("Every signing attempt must have at least one candidate")
 
     for trace_type in trace_dirs:
-        raw_trs_dir = base_traces_dir + trace_type + "/"
-        cut_trs_dir = base_traces_dir + trace_type + "_cut/"
-
-        print(f"处理 {trace_type} 目录...")
-
-        # 创建目标目录
-        if not os.path.exists(cut_trs_dir):
-            os.makedirs(cut_trs_dir)
-
-        # 获取所有波形文件
-        if not os.path.exists(raw_trs_dir):
-            print(f"警告: 源目录 {raw_trs_dir} 不存在，跳过")
-            continue
-
-        trace_files = [f for f in os.listdir(raw_trs_dir) if f.endswith(".npz")]
-        if not trace_files:
-            print(f"警告: 目录 {raw_trs_dir} 中没有找到 .npz 文件，跳过")
-            continue
-
-        print(f"找到 {len(trace_files)} 个波形文件")
-
-        # 第一步：找到最短的波形长度
-        trs_len = 0x3F3F3F3F
-        print(f"正在计算 {trace_type} 的最短波形长度...")
-
-        for trace_file in tqdm.tqdm(trace_files, desc=f"计算 {trace_type} 最短长度"):
-            try:
-                data = np.load(raw_trs_dir + trace_file)
-                if "trigger" in data:
-                    trigger = data["trigger"]
-                    current_len = np.sum(trigger < trigger_threshold)
-                    trs_len = min(trs_len, current_len)
-                    if current_len < min_trs_len:
-                        print(f"警告: 文件 {trace_file} 的波形长度异常: {current_len}")
-                data.close()
-            except Exception as e:
-                print(f"错误: 读取文件 {trace_file} 时出错: {e}")
-                continue
-
-        if trs_len == 0x3F3F3F3F:
-            print(f"错误: 无法确定 {trace_type} 的波形长度，跳过")
-            continue
-
-        print(f"{trace_type} 的最短波形长度: {trs_len}")
-
-        # 第二步：截取并保存波形
-        print(f"正在截取并保存 {trace_type} 波形...")
+        raw_dir = base_traces_dir / trace_type
+        cut_dir = base_traces_dir / f"{trace_type}_cut"
+        cut_dir.mkdir(parents=True, exist_ok=True)
+        if not raw_dir.is_dir():
+            raise FileNotFoundError(f"Raw trace directory not found: {raw_dir}")
 
         if trace_type == "y":
-            # y 目录处理：直接截取每个文件
-            for trace_file in tqdm.tqdm(trace_files, desc=f"截取 {trace_type} 波形"):
-                try:
-                    data = np.load(raw_trs_dir + trace_file)
-                    trigger = data["trigger"]
-                    trace = data["trace"]
-
-                    # 根据触发信号截取波形
-                    cut_trace = trace[trigger < trigger_threshold][:trs_len]
-
-                    # 生成输出文件名: trace000000.npz -> trs000000.npy
-                    output_name = trace_file.replace("trace", "trs").replace(
-                        ".npz", ".npy"
-                    )
-
-                    # 保存截取后的波形
-                    np.save(cut_trs_dir + output_name, cut_trace)
-
-                    data.close()
-
-                except Exception as e:
-                    print(f"错误: 处理文件 {trace_file} 时出错: {e}")
-                    continue
+            expected_names = [f"trace{index:06d}.npz" for index in range(10_000)]
         else:
-            # c 和 cs1 目录处理：需要按签名分组，合并拒绝采样的波形
-            print("Reading rejection count information...")
-            rej_num_list = []
-            with open("seed and rej num.txt", "r") as f:
-                for i in range(total_sign_num):
-                    line = f.readline().strip().split(" ")
-                    rej_num = int(line[1])
-                    rej_num_list.append(rej_num)
-            rej_num_array = np.array(rej_num_list)
+            expected_names = [
+                f"trace{sign_index:06d}rej{candidate_index:06d}.npz"
+                for sign_index, count in enumerate(rejection_counts)
+                for candidate_index in range(int(count))
+            ]
+        missing = [name for name in expected_names if not (raw_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"{raw_dir} is missing {len(missing)} expected traces; first missing: {missing[0]}"
+            )
 
-            for sign_idx in tqdm.trange(total_sign_num, desc="处理签名"):
+        print(f"Processing {trace_type}: {len(expected_names):,} raw traces")
+        trace_lengths = []
+        for name in tqdm.tqdm(expected_names, desc=f"Inspect {trace_type} lengths"):
+            with np.load(raw_dir / name, allow_pickle=False) as archive:
+                if not {"trace", "trigger"}.issubset(archive.files):
+                    raise ValueError(f"Trace archive lacks trace/trigger arrays: {raw_dir / name}")
+                trace = archive["trace"]
+                trigger = archive["trigger"]
+                if trace.shape != trigger.shape:
+                    raise ValueError(f"Trace/trigger shape mismatch: {raw_dir / name}")
+                trace_lengths.append(int(np.count_nonzero(trigger < trigger_threshold)))
+
+        cut_length = min(trace_lengths)
+        if cut_length < min_trs_len:
+            raise ValueError(
+                f"Shortest {trace_type} trace is {cut_length} samples, below {min_trs_len}"
+            )
+        print(f"Using {cut_length:,} samples per trace")
+
+        if trace_type == "y":
+            for name in tqdm.tqdm(expected_names, desc="Cut y traces"):
+                with np.load(raw_dir / name, allow_pickle=False) as archive:
+                    selected = archive["trigger"] < trigger_threshold
+                    cut_trace = archive["trace"][selected][:cut_length]
+                output_name = name.replace("trace", "trs", 1).replace(".npz", ".npy")
+                np.save(cut_dir / output_name, cut_trace, allow_pickle=False)
+        else:
+            for sign_index, count in enumerate(tqdm.tqdm(rejection_counts, desc=f"Group {trace_type}")):
                 sign_traces = []
-                for rej_idx in tqdm.trange(
-                    rej_num_array[sign_idx], desc="处理拒绝采样", leave=False
-                ):
-                    try:
-                        data = np.load(
-                            raw_trs_dir + f"trace{sign_idx:06d}rej{rej_idx:06d}.npz"
-                        )
-                        trigger = data["trigger"]
-                        trace = data["trace"]
-                        cut_trace = trace[trigger < trigger_threshold][:trs_len]
-                        sign_traces.append(cut_trace)
-                    except Exception as e:
-                        print(f"错误: 处理文件 {f} 时出错: {e}")
-                        continue
-                if len(sign_traces) > 0:
-                    sign_traces_array = np.array(sign_traces)
-                    output_name = f"trs{sign_idx:06d}.npy"
-                    np.save(cut_trs_dir + output_name, sign_traces_array)
+                for candidate_index in range(int(count)):
+                    name = f"trace{sign_index:06d}rej{candidate_index:06d}.npz"
+                    with np.load(raw_dir / name, allow_pickle=False) as archive:
+                        selected = archive["trigger"] < trigger_threshold
+                        cut_trace = archive["trace"][selected][:cut_length]
+                    if cut_trace.shape != (cut_length,):
+                        raise ValueError(f"Unexpected cut trace length in {raw_dir / name}")
+                    sign_traces.append(cut_trace)
+                np.save(
+                    cut_dir / f"trs{sign_index:06d}.npy",
+                    np.asarray(sign_traces),
+                    allow_pickle=False,
+                )
 
-        print(f"{trace_type} 处理完成，截取后的文件保存在: {cut_trs_dir}")
+        print(f"Finished {trace_type}; cut arrays are in {cut_dir}")
 
-    print("所有波形截取处理完成！")
+    print("Trace preprocessing complete.")
+
+
+PROFILE_CONFIG = {
+    "m4": {
+        "data": "mldsa_m4_data",
+        "traces": "mldsa_m4_traces",
+        "metadata": "mldsa_m4",
+    },
+    "ref": {
+        "data": "mldsa_ref_data",
+        "traces": "mldsa_ref_traces",
+        "metadata": "mldsa_ref",
+    },
+}
+
+
+def _workspace_link(source: Path, destination: Path) -> None:
+    source = source.resolve(strict=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        if destination.resolve(strict=True) != source:
+            raise RuntimeError(f"Workspace link points to a different source: {destination}")
+        return
+    if destination.exists():
+        raise RuntimeError(f"Refusing to replace a non-link workspace path: {destination}")
+    destination.symlink_to(
+        os.path.relpath(source, destination.parent),
+        target_is_directory=source.is_dir(),
+    )
+
+
+def prepare_analysis_workspace(profile: str) -> Path:
+    """Link one implementation's archived inputs into a writable run workspace."""
+    if profile not in PROFILE_CONFIG:
+        raise ValueError(f"Unknown implementation profile: {profile}")
+    exp_root = Path(__file__).resolve().parents[1]
+    spec = PROFILE_CONFIG[profile]
+    workspace = exp_root / "reproducibility" / profile
+    for folder in ("py_code", "data", "traces", "exp_res"):
+        (workspace / folder).mkdir(parents=True, exist_ok=True)
+
+    metadata = exp_root / "metadata" / spec["metadata"]
+    _workspace_link(metadata / "s1.npy", workspace / "py_code" / "s1.npy")
+    _workspace_link(
+        metadata / "seed_and_rej_num.txt",
+        workspace / "py_code" / "seed and rej num.txt",
+    )
+
+    data_root = exp_root / "data" / spec["data"]
+    for name in ("c_all", "cs1_all", "y_valid", "z_valid"):
+        _workspace_link(data_root / name, workspace / "data" / name)
+
+    trace_root = exp_root / "traces" / spec["traces"]
+    for name in ("c", "cs1", "y"):
+        _workspace_link(trace_root / name, workspace / "traces" / name)
+
+    required = (
+        workspace / "py_code" / "s1.npy",
+        workspace / "py_code" / "seed and rej num.txt",
+        *(workspace / "data" / name for name in ("c_all", "cs1_all", "y_valid", "z_valid")),
+        *(workspace / "traces" / name for name in ("c", "cs1", "y")),
+    )
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing required input path(s): " + ", ".join(map(str, missing)))
+    print(f"Prepared {profile} run workspace: {workspace}")
+    return workspace
+
+
+def _stage_vary_c_templates(workspace: Path) -> None:
+    source_dir = workspace / "exp_res" / "c_all_cs1_all_bp"
+    destinations = (
+        workspace / "exp_res" / "c_all_cs1_all_bp_vary_c_acc",
+        workspace / "exp_res" / "c_rej_cs1_rej_bp_vary_c_acc",
+    )
+    required = [
+        source_dir / f"cs1_idx{index:03d}{suffix}.npy"
+        for index in range(256)
+        for suffix in ("ReserveClass", "ProbTest")
+    ]
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "Vary-c experiments need the cs1 template results generated by "
+            "--experiment all-signatures. Missing "
+            f"{len(missing)} files; first missing: {missing[0]}"
+        )
+    for destination_dir in destinations:
+        for source in required:
+            destination = destination_dir / source.name
+            if not destination.exists():
+                _workspace_link(source, destination)
+
+
+def run_reproduction(
+    profile: str,
+    experiment: str,
+    repeats: int = 10,
+    iterations: int = 10,
+    vary_iterations: int = 5,
+    max_signatures: int = 20,
+    max_rejected_signatures: int = 30,
+    workers: int = 6,
+    skip_preprocess: bool = False,
+    reuse_snr: bool = False,
+) -> None:
+    """Recompute one or all paper experiments from this profile's raw traces."""
+    global ANALYSIS_WORKERS
+    if min(repeats, iterations, vary_iterations, max_signatures, max_rejected_signatures, workers) < 1:
+        raise ValueError("repeats, iteration counts, signature limits, and workers must be positive integers")
+    ANALYSIS_WORKERS = min(workers, os.cpu_count() or 1)
+    workspace = prepare_analysis_workspace(profile)
+    vary_c_all = (0.99, 0.98, 0.97, 0.96, 0.95) if profile == "ref" else (0.99, 0.98, 0.97, 0.96)
+    vary_c_rejected = (1.00, 0.99, 0.98, 0.97, 0.96) if profile == "ref" else (1.00, 0.99, 0.98, 0.97)
+
+    if experiment in ("vary-c-all", "vary-c-rejected"):
+        _stage_vary_c_templates(workspace)
+
+    trace_types = {
+        "preprocess": ("y", "c", "cs1"),
+        "y": ("y",),
+        "valid": ("cs1",),
+        "all-signatures": ("c", "cs1"),
+        "vary-c-all": (),
+        "vary-c-rejected": (),
+        "all": ("y", "c", "cs1"),
+    }[experiment]
+
+    previous_cwd = Path.cwd()
+    previous_show = plt.show
+    try:
+        os.chdir(workspace / "py_code")
+        plt.show = lambda *args, **kwargs: None
+        if trace_types and not skip_preprocess:
+            batch_cut_traces(trace_types)
+
+        if experiment == "preprocess":
+            return
+
+        if experiment in ("y", "all"):
+            y_valid_bp_experiment(
+                exp_min_sign_num=1,
+                exp_max_sign_num=max_signatures,
+                rerun_snr=True,
+                rerun_ta=True,
+                exp_repeat_num=repeats,
+                bp_iter_num=iterations,
+                snr_threshold=0.5,
+                use_parallel_gen_sp=True,
+                bp_process_num=ANALYSIS_WORKERS,
+                run_bp=False,
+            )
+        if experiment in ("valid", "all"):
+            cs1_valid_bp_experiment(
+                exp_min_sign_num=1,
+                exp_max_sign_num=max_signatures,
+                rerun_snr=True,
+                rerun_ta=True,
+                exp_repeat_num=repeats,
+                bp_iter_num=iterations,
+                poi_num=200,
+                class_reserve_threshold=10,
+            )
+        if experiment in ("all-signatures", "all"):
+            c_all_cs1_all_bp_experiment(
+                rerun_c_snr=not reuse_snr,
+                snr_c_plot=True,
+                rerun_c_ta=True,
+                rerun_cs1_snr=not reuse_snr,
+                snr_cs1_plot=True,
+                rerun_cs1_ta=True,
+                process_num=ANALYSIS_WORKERS,
+                poi_num=200,
+                exp_repeat_num=repeats,
+                exp_min_sign_num=1,
+                exp_max_sign_num=max_signatures,
+                bp_iter_num=iterations,
+            )
+            _stage_vary_c_templates(workspace)
+        if experiment in ("vary-c-all", "all"):
+            c_all_cs1_all_bp_vary_c_acc_experiment(
+                exp_repeat_num=repeats,
+                exp_min_sign_num=1,
+                exp_max_sign_num=max_signatures,
+                bp_iter_num=vary_iterations,
+                c_acc_values=vary_c_all,
+            )
+        if experiment in ("vary-c-rejected", "all"):
+            c_rej_cs1_rej_bp_vary_c_acc_experiment(
+                exp_repeat_num=repeats,
+                exp_min_sign_num=1,
+                exp_max_sign_num=max_rejected_signatures,
+                bp_iter_num=vary_iterations,
+                c_acc_values=vary_c_rejected,
+            )
+    finally:
+        plt.show = previous_show
+        os.chdir(previous_cwd)
+    print(f"Finished {profile}/{experiment}; new arrays are in {workspace / 'exp_res'}")
+
+
+def _main_cli() -> int:
+    parser = argparse.ArgumentParser(
+        description="Recompute the ML-DSA paper experiments from archived traces and data."
+    )
+    parser.add_argument("--profile", choices=tuple(PROFILE_CONFIG), required=True)
+    parser.add_argument(
+        "--experiment",
+        choices=("preprocess", "y", "valid", "all-signatures", "vary-c-all", "vary-c-rejected", "all"),
+        default="all",
+    )
+    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--vary-iterations", type=int, default=5)
+    parser.add_argument("--max-signatures", type=int, default=20)
+    parser.add_argument("--max-rejected-signatures", type=int, default=30)
+    parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument(
+        "--skip-preprocess",
+        action="store_true",
+        help="reuse existing cut traces in reproducibility/<profile>/traces",
+    )
+    parser.add_argument(
+        "--reuse-snr",
+        action="store_true",
+        help="reuse c/cs1 SNR arrays already present in this profile workspace",
+    )
+    args = parser.parse_args()
+    try:
+        run_reproduction(
+            args.profile,
+            args.experiment,
+            args.repeats,
+            args.iterations,
+            args.vary_iterations,
+            args.max_signatures,
+            args.max_rejected_signatures,
+            args.workers,
+            args.skip_preprocess,
+            args.reuse_snr,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    return 0
 
 
 if __name__ == "__main__":
-    # gen_seed_and_rej_num(10000)
-    # gen_valid_data()
-    # get_s1()
-    # gen_all_data()
-    # cs1_trace_capture("../traces/cs1/", 0, 10000)
-    # y_trace_capture("../traces/y/", 0, 10000)
-    # c_trace_capture("../traces/c/", 0, 10000)
-
-    # 批量处理波形截取
-    # batch_cut_traces()
-
-    # 补充实验：31-40个签名，使用简化版本测试
-    # y_valid_bp_experiment(
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,  # 先测试小范围
-    #     rerun_snr=False,
-    #     rerun_ta=True,
-    #     exp_repeat_num=1,  # 先测试少量重复
-    #     bp_iter_num=15,
-    #     snr_threshold=0.05,
-    #     use_parallel_gen_sp=True,  # 先关闭并行化测试
-    #     bp_process_num=8,  # 减少进程数
-    # )
-
-    # 查看BP实验结果
-    # view_y_valid_bp_res(
-    #     exp_save_path="../exp_res/y_valid_bp/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     exp_repeat_num=10,
-    # )
-
-    # cs1_valid_bp_experiment(
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     rerun_snr=False,
-    #     rerun_ta=False,
-    #     exp_repeat_num=10,
-    #     bp_iter_num=10,
-    #     poi_num=200,
-    #     class_reserve_threshold=10,
-    # )
-
-    # view_cs1_valid_bp_res(
-    #     exp_save_path="../exp_res/cs1_valid_bp/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     exp_repeat_num=10,
-    # )
-
-    # c_all_cs1_all_bp_experiment(
-    #     rerun_c_snr=False,
-    #     snr_c_plot=False,
-    #     rerun_c_ta=False,
-    #     rerun_cs1_snr=False,
-    #     snr_cs1_plot=False,
-    #     rerun_cs1_ta=False,
-    #     process_num=4,
-    #     poi_num=200,
-    #     exp_repeat_num=1,
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=51,
-    #     bp_iter_num=10,
-    # )
-
-    # view_cs1_valid_bp_res(
-    #     exp_save_path="../exp_res/c_all_cs1_all_bp/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     exp_repeat_num=10,
-    # )    #     exp_save_path="../exp_res/cs1_valid_bp/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     exp_repeat_num=10,
-    # )
-
-    # c_all_cs1_all_bp_experiment(
-    #     rerun_c_snr=False,
-    #     snr_c_plot=False,
-    #     rerun_c_ta=False,
-    #     rerun_cs1_snr=False,
-    #     snr_cs1_plot=False,
-    #     rerun_cs1_ta=False,
-    #     process_num=4,
-    #     poi_num=200,
-    #     exp_repeat_num=10,
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     bp_iter_num=10,
-    # )
-
-    # view_cs1_valid_bp_res(
-    #     exp_save_path="../exp_res/c_rej_cs1_rej_bp/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     exp_repeat_num=10,
-    # )
-
-    # c_all_cs1_all_bp_vary_c_acc_experiment(
-    #     exp_repeat_num=3,
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     bp_iter_num=5,
-    # )
-
-    # view_bp_res_vary_c_acc(
-    #     exp_save_path="../exp_res/c_all_cs1_all_bp_vary_c_acc/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=20,
-    #     exp_repeat_num=3,
-    #     c_acc_list=[0.96, 0.97, 0.98, 0.99],
-    # )
-
-    # c_rej_cs1_rej_bp_vary_c_acc_experiment(
-    #     exp_repeat_num=10,
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=30,
-    #     bp_iter_num=5,
-    # )
-
-    # view_bp_res_vary_c_acc(
-    #     exp_save_path="../exp_res/c_rej_cs1_rej_bp_vary_c_acc/",
-    #     exp_min_sign_num=1,
-    #     exp_max_sign_num=30,
-    #     exp_repeat_num=10,
-    #     c_acc_list=[0.97, 0.98, 0.99, 1.00],
-    # )
-
-    pass
+    raise SystemExit(_main_cli())

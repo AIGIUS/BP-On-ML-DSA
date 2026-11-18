@@ -1,3 +1,3 @@
-# Waveform data
+# Raw waveforms
 
-The waveform archives are published as part of the Zenodo dataset. See the [dataset section in the main README](../../README.md#dataset) for the current DOI and version information.
+`mldsa_m4_traces/` and `mldsa_ref_traces/` contain compressed `.npz` files with `trace` and `trigger` arrays for `y`, `c`, and `cs1`. The analysis CLI cuts and groups these into its legacy input layout under `reproducibility/<profile>/traces/`. See the [archive README](../README.md).

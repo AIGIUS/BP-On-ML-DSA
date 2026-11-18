@@ -13,6 +13,8 @@ class Template:
         self.dimen_reduce_num = None
         self.dimen_reduce_model = None
         self.class_num = None
+        self.cor_inv = None
+        self.normalizer = None
 
     def build_model(
         self, traces, label, class_num, dimen_reduce_method, dimen_reduce_num=10
@@ -46,6 +48,18 @@ class Template:
         for i in range(self.class_num):
             self.ave[i] = np.average(traces[label == i], axis=0)
             self.cor[i] = np.cov(traces[label == i].transpose())
+        # These terms depend only on the training set. Cache them once instead
+        # of recalculating inverse/determinant for every tested trace.
+        self.cor_inv = np.stack([np.linalg.inv(cov) for cov in self.cor])
+        self.normalizer = np.asarray(
+            [
+                np.sqrt(
+                    (2 * np.pi) ** self.dimen_reduce_num * np.linalg.det(cov)
+                )
+                for cov in self.cor
+            ],
+            dtype=float,
+        )
 
     def apply_model(self, traces):
         """
@@ -60,19 +74,18 @@ class Template:
             or self.class_num is None
         ):
             raise Exception("Template not yet established")
-        prob = np.zeros((traces.shape[0], self.class_num), dtype=float)
         if self.dimen_reduce_method == "lda":
             traces = self.dimen_reduce_model.transform(traces)
-        # for i in tqdm.trange(traces.shape[0], desc="Template classification (traces)", leave=False):
-        for i in range(traces.shape[0]):
-            for j in range(self.class_num):
-                noise_valid = traces[i] - self.ave[j]
-                P1 = np.exp(
-                    -0.5 * (noise_valid @ np.linalg.inv(self.cor[j]) @ noise_valid.T)
-                )
-                P2 = np.sqrt(
-                    (2 * np.pi) ** self.dimen_reduce_num * np.linalg.det(self.cor[j])
-                )
-                prob[i, j] = P1 / P2
-            prob[i] = Utils.more_stable_softmax(np.log(prob[i] + 1e-50))
+        prob = np.zeros((traces.shape[0], self.class_num), dtype=float)
+        for j in range(self.class_num):
+            difference = traces - self.ave[j]
+            quadratic = np.sum((difference @ self.cor_inv[j]) * difference, axis=1)
+            prob[:, j] = np.exp(-0.5 * quadratic) / self.normalizer[j]
+
+        # Keep the legacy floor and softmax behavior while normalizing rows in
+        # one vectorized operation.
+        log_prob = np.log(prob + 1e-50)
+        log_prob -= np.max(log_prob, axis=1, keepdims=True)
+        prob = np.exp(log_prob)
+        prob /= np.sum(prob, axis=1, keepdims=True)
         return prob
