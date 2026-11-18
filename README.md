@@ -2,9 +2,13 @@
 
 ## Project Overview
 
-This repository contains the experimental code and data for the paper **"Release the Power of Rejected Signatures: An Efficient Side-Channel Attack on Dilithium"**.
+This repository contains the experimental code for **“Release the Power of Rejected Signatures: An Efficient Side-Channel Attack on the ML-DSA Cryptosystem”**.
 
-**Paper Link**: [https://eprint.iacr.org/2025/582](https://eprint.iacr.org/2025/582)
+**Paper:** [IEEE Transactions on Information Forensics and Security](https://doi.org/10.1109/TIFS.2025.3643784) · [IACR ePrint 2025/582](https://eprint.iacr.org/2025/582)
+
+## Dataset
+
+The [Zenodo dataset (version 1.0.0)](https://doi.org/10.5281/zenodo.24312689) replaces the former Baidu Netdisk share. Its six archives (33.72 GB total) correspond to the experiments in version 2 of [IACR ePrint 2025/582](https://eprint.iacr.org/2025/582).
 
 ## Abstract
 
@@ -45,13 +49,13 @@ Experimental data and code directory:
 - **py_code/**: Contains Belief Propagation algorithm implementation and data analysis scripts
 - **traces/**: Stores side-channel traces collected from STM32 devices
 
-## Important Notes
-
-⚠️ **Version Information**: The uploaded data corresponds to the **second version** of the paper on ePrint, not the first version. The second version includes additional experimental data and result analysis compared to the first version.
-
 ## Citation
 
-If you use the code or data from this project, please cite the following paper:
+If you use the code or data, please cite the [published TIFS article](https://doi.org/10.1109/TIFS.2025.3643784). If you use the data, please also cite the [Zenodo dataset](https://doi.org/10.5281/zenodo.24312689):
+
+> Liu, Z. (2026). *Experimental Dataset for “Release the Power of Rejected Signatures: An Efficient Side-Channel Attack on the ML-DSA Cryptosystem”* (Version 1.0.0) [Dataset]. Zenodo. [10.5281/zenodo.24312689](https://doi.org/10.5281/zenodo.24312689).
+
+The original preprint citation is provided below for reference:
 
 ```bibtex
 @misc{cryptoeprint:2025/582,
